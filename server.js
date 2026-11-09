@@ -1,15 +1,23 @@
 // Minimal static server for the Wrenqo marketing site on Railway.
 // Serves index.html for every page, plus sitemap.xml and robots.txt.
 // POST /api/trial accepts trial signup requests and emails them to the team
-// via Gmail SMTP (SMTP_USER / SMTP_PASS env vars, app password).
+// via Resend (RESEND_API_KEY env var) first, with Gmail SMTP
+// (SMTP_USER / SMTP_PASS env vars, app password) as fallback.
 // It also sends a confirmation email to the person who signed up.
 // Every request is also appended to trial-requests.jsonl as a backup.
+// Resend sends over HTTPS, so it is not affected by the Railway network
+// block that stops outbound SMTP to smtp.gmail.com.
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
 const PORT = process.env.PORT || 3000;
 const TRIAL_TO = process.env.TRIAL_TO || 'hellowrenqo@gmail.com';
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+// Sender shown on trial emails. Before the domain is verified in Resend,
+// use the Resend default onboarding@resend.dev. After wrenqo.com is
+// verified, set RESEND_FROM to e.g. 'Wrenqo <hello@wrenqo.com>'.
+const RESEND_FROM = process.env.RESEND_FROM || 'Wrenqo <onboarding@resend.dev>';
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.xml': 'application/xml; charset=utf-8',
@@ -35,13 +43,56 @@ function getTransporter() {
   return transporter;
 }
 
+// Send one email through the Resend HTTP API. Resolves true on success.
+async function sendViaResend(to, subject, text) {
+  if (!RESEND_API_KEY) return false;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer ' + RESEND_API_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ from: RESEND_FROM, to, subject, text }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      console.error('resend send failed', res.status, await res.text().catch(() => ''));
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error('resend send error', err);
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Callback-style wrapper so the SMTP fallback can reuse the same shape.
+function sendMailSmtp(to, subject, text) {
+  return new Promise((resolve) => {
+    const tx = getTransporter();
+    if (!tx) return resolve(false);
+    tx.sendMail({ from: process.env.SMTP_USER, to, subject, text }, (err) => {
+      if (err) {
+        console.error('trial mail failed', err);
+        return resolve(false);
+      }
+      resolve(true);
+    });
+  });
+}
+
 function handleTrial(req, res) {
   let body = '';
   req.on('data', (chunk) => {
     body += chunk;
     if (body.length > 10000) req.destroy();
   });
-  req.on('end', () => {
+  req.on('end', async () => {
     let data = {};
     try {
       data = JSON.parse(body || '{}');
@@ -66,13 +117,7 @@ function handleTrial(req, res) {
       JSON.stringify(record) + '\n',
       () => {}
     );
-    const tx = getTransporter();
-    if (!tx) {
-      // Mail not configured yet - request is logged; form still shows success.
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ ok: true, mailed: false }));
-    }
-    const text = [
+    const teamText = [
       'New Wrenqo free-trial request',
       '',
       'Email: ' + record.email,
@@ -81,52 +126,48 @@ function handleTrial(req, res) {
       'Technicians: ' + (record.techs || '-'),
       'Received: ' + record.at,
     ].join('\n');
-    tx.sendMail(
-      {
-        from: process.env.SMTP_USER,
-        to: TRIAL_TO,
-        subject: 'New free-trial request: ' + record.email,
-        text,
-      },
-      (err) => {
-        if (err) {
-          console.error('trial mail failed', err);
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          return res.end(JSON.stringify({ ok: true, mailed: false }));
-        }
-        // Best-effort confirmation email to the customer.
-        const confirmText = [
-          'Hi,',
-          '',
-          'Thanks for requesting a free 14-day trial of Wrenqo.',
-          '',
-          'We received your request and will email you within 24 hours',
-          'with your trial access.',
-          '',
-          'What is Wrenqo? Field-service software for small HVAC,',
-          'plumbing and electrical shops - scheduling, dispatch,',
-          'invoicing and payments in one app, $39/month flat.',
-          '',
-          'Questions? Reply to this email or write to hellowrenqo@gmail.com.',
-          '',
-          'Thanks,',
-          'The Wrenqo team',
-        ].join('\n');
-        tx.sendMail(
-          {
-            from: process.env.SMTP_USER,
-            to: record.email,
-            subject: 'Your Wrenqo trial request is received',
-            text: confirmText,
-          },
-          (confirmErr) => {
-            if (confirmErr) console.error('trial confirm mail failed', confirmErr);
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: true, mailed: true }));
-          }
-        );
-      }
+    const confirmText = [
+      'Hi,',
+      '',
+      'Thanks for requesting a free 14-day trial of Wrenqo.',
+      '',
+      'We received your request and will email you within 24 hours',
+      'with your trial access.',
+      '',
+      'What is Wrenqo? Field-service software for small home-service',
+      'shops - scheduling, dispatch, invoicing and payments in one',
+      'app, $39/month flat.',
+      '',
+      'Questions? Reply to this email or write to hellowrenqo@gmail.com.',
+      '',
+      'Thanks,',
+      'The Wrenqo team',
+    ].join('\n');
+    // Try Resend first, then Gmail SMTP as fallback.
+    let teamSent = await sendViaResend(TRIAL_TO, 'New free-trial request: ' + record.email, teamText);
+    if (!teamSent) {
+      teamSent = await sendMailSmtp(TRIAL_TO, 'New free-trial request: ' + record.email, teamText);
+    }
+    if (!teamSent) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true, mailed: false }));
+    }
+    // Best-effort confirmation email to the customer.
+    let confirmSent = await sendViaResend(
+      record.email,
+      'Your Wrenqo trial request is received',
+      confirmText
     );
+    if (!confirmSent) {
+      confirmSent = await sendMailSmtp(
+        record.email,
+        'Your Wrenqo trial request is received',
+        confirmText
+      );
+    }
+    if (!confirmSent) console.error('trial confirm mail failed');
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, mailed: true }));
   });
 }
 
