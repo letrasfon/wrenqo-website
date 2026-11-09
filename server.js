@@ -108,12 +108,41 @@ function handleTrial(req, res) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ ok: false, error: 'valid email required' }));
     }
+    // Trial-abuse rule: log the signup IP + device fingerprint, and flag a
+    // repeat trial (same IP or same device as an earlier request). The flag
+    // only goes to the team email — the customer-facing reply stays the
+    // same; a human decides whether it is a different business.
+    const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    const ip = forwarded || (req.socket && req.socket.remoteAddress) || '';
+    const deviceFingerprint = String(data.deviceFingerprint || '').trim();
+    let repeatTrial = false;
+    try {
+      const logPath = path.join(__dirname, 'trial-requests.jsonl');
+      if (fs.existsSync(logPath)) {
+        const lines = fs.readFileSync(logPath, 'utf8').split('\n');
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let prev = null;
+          try { prev = JSON.parse(line); } catch (e) { /* skip bad line */ }
+          if (!prev) continue;
+          if ((ip && prev.ip === ip) || (deviceFingerprint && prev.deviceFingerprint === deviceFingerprint)) {
+            repeatTrial = true;
+            break;
+          }
+        }
+      }
+    } catch (e) {
+      /* log unreadable — treat as first trial */
+    }
     const record = {
       at: new Date().toISOString(),
       email,
       shopName: String(data.shopName || ''),
       trade: String(data.trade || ''),
       techs: String(data.techs || ''),
+      ip,
+      deviceFingerprint,
+      repeatTrial,
     };
     // Always log the request (backup) even if mail is not configured.
     fs.appendFile(
@@ -121,15 +150,22 @@ function handleTrial(req, res) {
       JSON.stringify(record) + '\n',
       () => {}
     );
-    const teamText = [
+    const teamLines = [
       'New Wrenqo free-trial request',
       '',
       'Email: ' + record.email,
       'Shop name: ' + (record.shopName || '-'),
       'Trade: ' + (record.trade || '-'),
       'Technicians: ' + (record.techs || '-'),
+      'IP: ' + (record.ip || '-'),
+      'Device fingerprint: ' + (record.deviceFingerprint || '-'),
       'Received: ' + record.at,
-    ].join('\n');
+    ];
+    if (repeatTrial) {
+      teamLines.push('', 'NOTE: same IP or device as an earlier request — per the trial rule, a repeat signup gets NO new trial (must pay). Reply only if this is a different business.');
+    }
+    const teamText = teamLines.join('\n');
+    const teamSubject = (repeatTrial ? 'REPEAT TRIAL? ' : '') + 'New free-trial request: ' + record.email;
     const confirmText = [
       'Hi,',
       '',
@@ -148,9 +184,9 @@ function handleTrial(req, res) {
       'The Wrenqo team',
     ].join('\n');
     // Try Resend first, then Gmail SMTP as fallback.
-    let teamSent = await sendViaResend(TRIAL_TO, 'New free-trial request: ' + record.email, teamText);
+    let teamSent = await sendViaResend(TRIAL_TO, teamSubject, teamText);
     if (!teamSent) {
-      teamSent = await sendMailSmtp(TRIAL_TO, 'New free-trial request: ' + record.email, teamText);
+      teamSent = await sendMailSmtp(TRIAL_TO, teamSubject, teamText);
     }
     if (!teamSent) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
