@@ -24,6 +24,10 @@ const MIME = {
   '.txt': 'text/plain; charset=utf-8',
 };
 
+// Valid page paths (45). Any other GET path returns a real 404 instead of
+// the homepage (soft-404 fix, 2026-11-10).
+const PAGE_PATHS = new Set(['/', '/about-us', '/appliance-repair-software', '/blog', '/blog/flat-rate-pricing-guide', '/blog/get-paid-same-day-invoicing', '/blog/how-to-choose-field-service-software', '/blog/per-technician-pricing-cost', '/blog/recurring-service-routes', '/blog/working-offline-no-signal', '/cleaning-business-software', '/contact-us', '/electrical-contractor-software', '/faqs', '/field-service-software-by-trade', '/field-service-software-features', '/field-service-software-pricing', '/field-service-software-setup', '/flat-rate-price-book-software', '/garage-door-software', '/handyman-business-software', '/help', '/help/build-price-book', '/help/export-data-and-cancel', '/help/five-minute-setup', '/help/import-customers', '/help/send-first-invoice', '/help/start-free-trial', '/hvac-scheduling-app', '/invoicing-software-for-contractors', '/lawn-care-software', '/locksmith-software', '/offline-field-service-app', '/online-booking-software', '/pest-control-software', '/plumbing-scheduling-software', '/pool-service-software', '/privacy-policy', '/quickbooks-field-service-software', '/recurring-jobs-software', '/refund-policy', '/roofing-contractor-software', '/scheduling-dispatch-software', '/terms-of-service', '/work-order-app']);
+
 let transporter = null;
 function getTransporter() {
   if (transporter) return transporter;
@@ -171,9 +175,67 @@ function handleTrial(req, res) {
   });
 }
 
+// POST /api/feedback: feedback / problem reports from the site's feedback
+// form. Emails the team via Resend first, Gmail SMTP as fallback, and logs
+// every report to feedback.jsonl as a backup.
+function handleFeedback(req, res) {
+  let body = '';
+  req.on('data', (chunk) => {
+    body += chunk;
+    if (body.length > 10000) req.destroy();
+  });
+  req.on('end', async () => {
+    let data = {};
+    try {
+      data = JSON.parse(body || '{}');
+    } catch (e) {
+      /* ignore malformed JSON */
+    }
+    const email = String(data.email || '').trim();
+    const message = String(data.message || '').trim();
+    if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || !message) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: false, error: 'valid email and message required' }));
+    }
+    const record = {
+      at: new Date().toISOString(),
+      name: String(data.name || ''),
+      email,
+      page: String(data.page || ''),
+      message,
+    };
+    fs.appendFile(
+      path.join(__dirname, 'feedback.jsonl'),
+      JSON.stringify(record) + '\n',
+      () => {}
+    );
+    const text = [
+      'New Wrenqo feedback / problem report',
+      '',
+      'Name: ' + (record.name || '-'),
+      'Email: ' + record.email,
+      'Page: ' + (record.page || '-'),
+      'Received: ' + record.at,
+      '',
+      record.message,
+    ].join('\n');
+    let sent = await sendViaResend(TRIAL_TO, 'Wrenqo feedback from ' + record.email, text);
+    if (!sent) {
+      sent = await sendMailSmtp(TRIAL_TO, 'Wrenqo feedback from ' + record.email, text);
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, mailed: sent }));
+  });
+}
+
 const server = http.createServer((req, res) => {
   const urlPath = decodeURIComponent(req.url.split('?')[0]);
   if (req.method === 'POST' && urlPath === '/api/trial') return handleTrial(req, res);
+  if (req.method === 'POST' && urlPath === '/api/feedback') return handleFeedback(req, res);
+  if (req.method === 'GET' && urlPath !== '/sitemap.xml' && urlPath !== '/robots.txt' && !PAGE_PATHS.has(urlPath)) {
+    res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
+    return res.end('<!doctype html><html><head><title>Page not found — Wrenqo</title><meta name="robots" content="noindex, follow"></head><body><h1>Page not found</h1><p>Sorry, this page does not exist. <a href="/">Go to the Wrenqo home page</a>.</p></body></html>');
+  }
   let file = path.join(__dirname, 'index.html');
   if (urlPath === '/sitemap.xml' || urlPath === '/robots.txt') {
     file = path.join(__dirname, urlPath);
