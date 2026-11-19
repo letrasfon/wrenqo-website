@@ -26,7 +26,7 @@ const MIME = {
 
 // Valid page paths (45). Any other GET path returns a real 404 instead of
 // the homepage (soft-404 fix, 2026-11-10).
-const PAGE_PATHS = new Set(['/', '/about-us', '/appliance-repair-software', '/blog', '/blog/flat-rate-pricing-guide', '/blog/get-paid-same-day-invoicing', '/blog/how-to-choose-field-service-software', '/blog/per-technician-pricing-cost', '/blog/recurring-service-routes', '/blog/working-offline-no-signal', '/cleaning-business-software', '/contact-us', '/electrical-contractor-software', '/faqs', '/field-service-software-by-trade', '/field-service-software-features', '/field-service-software-pricing', '/field-service-software-setup', '/flat-rate-price-book-software', '/garage-door-software', '/handyman-business-software', '/help', '/help/build-price-book', '/help/export-data-and-cancel', '/help/five-minute-setup', '/help/import-customers', '/help/send-first-invoice', '/help/start-free-trial', '/hvac-scheduling-app', '/invoicing-software-for-contractors', '/lawn-care-software', '/locksmith-software', '/offline-field-service-app', '/online-booking-software', '/pest-control-software', '/plumbing-scheduling-software', '/pool-service-software', '/privacy-policy', '/quickbooks-field-service-software', '/recurring-jobs-software', '/refund-policy', '/roofing-contractor-software', '/scheduling-dispatch-software', '/terms-of-service', '/work-order-app']);
+const PAGE_PATHS = new Set(['/', '/about-us', '/appliance-repair-software', '/blog', '/blog/flat-rate-pricing-guide', '/blog/same-day-invoicing', '/blog/how-to-choose-field-service-software', '/blog/per-technician-pricing-cost', '/blog/recurring-service-routes', '/blog/working-offline-no-signal', '/cleaning-business-software', '/contact-us', '/electrical-contractor-software', '/faqs', '/field-service-software-by-trade', '/field-service-software-features', '/field-service-software-pricing', '/field-service-software-setup', '/flat-rate-price-book-software', '/garage-door-software', '/handyman-business-software', '/help', '/help/build-price-book', '/help/export-data-and-cancel', '/help/five-minute-setup', '/help/import-customers', '/help/send-first-invoice', '/help/start-free-trial', '/hvac-scheduling-app', '/invoicing-software-for-contractors', '/lawn-care-software', '/locksmith-software', '/offline-field-service-app', '/online-booking-software', '/pest-control-software', '/plumbing-scheduling-software', '/pool-service-software', '/privacy-policy', '/quickbooks-field-service-software', '/recurring-jobs-software', '/refund-policy', '/roofing-contractor-software', '/scheduling-dispatch-software', '/terms-of-service', '/work-order-app']);
 
 let transporter = null;
 function getTransporter() {
@@ -268,6 +268,11 @@ const server = http.createServer((req, res) => {
   const urlPath = decodeURIComponent(req.url.split('?')[0]);
   if (req.method === 'POST' && urlPath === '/api/trial') return handleTrial(req, res);
   if (req.method === 'POST' && urlPath === '/api/feedback') return handleFeedback(req, res);
+  // 301: blog slug renamed 2026-11-19 (Paddle-appeal wording cleanup).
+  if (req.method === 'GET' && urlPath === '/blog/get-paid-same-day-invoicing') {
+    res.writeHead(301, { Location: '/blog/same-day-invoicing' });
+    return res.end();
+  }
   if (req.method === 'GET' && urlPath !== '/sitemap.xml' && urlPath !== '/robots.txt' && !PAGE_PATHS.has(urlPath)) {
     res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
     return res.end('<!doctype html><html><head><title>Page not found — Wrenqo</title><meta name="robots" content="noindex, follow"></head><body><h1>Page not found</h1><p>Sorry, this page does not exist. <a href="/">Go to the Wrenqo home page</a>.</p></body></html>');
