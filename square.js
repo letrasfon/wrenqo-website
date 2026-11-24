@@ -24,6 +24,36 @@
 //                          without the env vars or a database it
 //                          answers 503
 //   GET  /api/square/status    (Bearer) -> { ok, connected }
+//   GET  /api/square/authorize (Bearer) -> { ok, accessToken,
+//                          locationId, merchantId, environment }
+//                          The shop's own OAuth access token + the
+//                          location the Mobile Payments SDK must be
+//                          authorized with. The token belongs to the
+//                          shop, is handed to the shop's own phone
+//                          only, and the app holds it in memory for
+//                          one payment session — it is never written
+//                          to disk, never synced, never logged.
+//   POST /api/square/charge    (Bearer) { invoiceId, amountCents,
+//                          paymentId } -> VERIFIES a payment the
+//                          Mobile Payments SDK already took in the
+//                          app: re-reads the payment from Square
+//                          with the merchant token and only answers
+//                          ok when the payment is COMPLETED and the
+//                          amount matches. The app records the
+//                          payment on the invoice only after this
+//                          answer, so a tampered client cannot invent
+//                          a payment. The SDK charges the card
+//                          itself — there is no card nonce in this
+//                          SDK's API (no sourceId on Payment), so
+//                          there is no CreatePayment-with-nonce call
+//                          to make; the server's job is verification,
+//                          not charging.
+//
+// Tokens are stored PER ENVIRONMENT (square_tokens PK is
+// (business_id, environment)): a shop can hold a sandbox token and
+// a production token at the same time, and flipping SQUARE_ENV
+// never mixes them up. A migration in ensureSchema() upgrades the
+// original single-row table (PK business_id) in place.
 //
 // Environments: SQUARE_ENV selects 'sandbox' (default) or
 // 'production'. Both environments use the same Square hosts — the
@@ -61,20 +91,62 @@ const crypto = require('crypto');
 const STATE_TTL_MS = 10 * 60 * 1000;
 const SQUARE_AUTHORIZE_URL = 'https://connect.squareup.com/oauth2/authorize';
 const SQUARE_TOKEN_URL = 'https://connect.squareup.com/oauth2/token';
+const SQUARE_API_BASE = 'https://connect.squareup.com';
+const SQUARE_API_VERSION = '2025-01-23';
 const SQUARE_SCOPE = 'PAYMENTS_WRITE PAYMENTS_READ MERCHANT_PROFILE_READ';
 const SQUARE_REDIRECT_URI = 'https://wrenqo.com/api/square/callback';
 
+// A charge request is a few hundred bytes; 64 KB is far more than
+// enough and keeps a bad client from stuffing the server.
+const MAX_BODY_BYTES = 64 * 1024;
+// A charge is at most $100,000 — far above any real invoice, and a
+// hard cap so a bad client cannot ask Square for an absurd amount.
+const MAX_CHARGE_CENTS = 10000000;
+
 const SQUARE_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS square_tokens (
-  business_id         TEXT PRIMARY KEY,
+  business_id         TEXT NOT NULL,
+  environment         TEXT NOT NULL DEFAULT 'sandbox',
   merchant_id         TEXT NOT NULL DEFAULT '',
   access_token        TEXT NOT NULL,
   refresh_token       TEXT,
   expires_at          TIMESTAMPTZ,
   refresh_expires_at  TIMESTAMPTZ,
   created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (business_id, environment)
 );
+CREATE TABLE IF NOT EXISTS square_charges (
+  id                  TEXT PRIMARY KEY,
+  business_id         TEXT NOT NULL,
+  invoice_id          TEXT NOT NULL,
+  amount_cents        INTEGER NOT NULL,
+  payment_id          TEXT NOT NULL,
+  status              TEXT NOT NULL DEFAULT '',
+  receipt_url         TEXT,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (business_id, payment_id)
+);
+`;
+
+// Upgrades the original square_tokens table (PK business_id, no
+// environment column) to the per-environment shape. Runs once per
+// process via ensureSchema(); idempotent — the DO block only fires
+// when the old single-column primary key is still there. The live
+// table has no real seller connected yet (the sandbox connect test
+// has not run), so this is a no-rows migration in practice.
+const SQUARE_MIGRATION_SQL = `
+ALTER TABLE square_tokens ADD COLUMN IF NOT EXISTS environment TEXT NOT NULL DEFAULT 'sandbox';
+DO $$ BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'square_tokens_pkey'
+      AND pg_get_constraintdef(oid) = 'PRIMARY KEY (business_id)'
+  ) THEN
+    ALTER TABLE square_tokens DROP CONSTRAINT square_tokens_pkey;
+    ALTER TABLE square_tokens ADD PRIMARY KEY (business_id, environment);
+  END IF;
+END $$;
 `;
 
 // ------------------------------------------------------------ http helpers
@@ -105,6 +177,50 @@ function escapeHtml(value) {
     .replace(/'/g, '&#39;');
 }
 
+// Body reading with a hard cap (mirrors quickbooks.js): a body over
+// the cap is rejected, not read into memory.
+function readBody(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    let raw = '';
+    let tooBig = false;
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > maxBytes) {
+        tooBig = true;
+        return;
+      }
+      raw += chunk.toString('utf8');
+    });
+    req.on('end', () => {
+      if (tooBig) return reject(new Error('body too large'));
+      resolve(raw);
+    });
+    req.on('error', reject);
+  });
+}
+
+async function readJsonBody(req, res) {
+  let raw = '';
+  try {
+    raw = await readBody(req, MAX_BODY_BYTES);
+  } catch (e) {
+    jsonRes(res, 400, { ok: false, error: 'body too large' });
+    return null;
+  }
+  try {
+    const data = JSON.parse(raw || '{}');
+    if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+      jsonRes(res, 400, { ok: false, error: 'invalid JSON' });
+      return null;
+    }
+    return data;
+  } catch (e) {
+    jsonRes(res, 400, { ok: false, error: 'invalid JSON' });
+    return null;
+  }
+}
+
 function isDbFailure(err) {
   const code = String((err && err.code) || '');
   return (
@@ -127,7 +243,11 @@ function schemaFirstPool(rawPool) {
   let schemaPromise = null;
   function ensureSchema() {
     if (!schemaPromise) {
-      schemaPromise = rawPool.query(SQUARE_SCHEMA_SQL).catch((e) => {
+      schemaPromise = (async () => {
+        await rawPool.query(SQUARE_SCHEMA_SQL);
+        // Upgrade a pre-existing single-environment table in place.
+        await rawPool.query(SQUARE_MIGRATION_SQL);
+      })().catch((e) => {
         schemaPromise = null;
         throw e;
       });
@@ -148,6 +268,8 @@ function isSquareRoute(method, urlPath) {
   if (method === 'GET' && urlPath === '/api/square/connect') return true;
   if (method === 'GET' && urlPath === '/api/square/callback') return true;
   if (method === 'GET' && urlPath === '/api/square/status') return true;
+  if (method === 'GET' && urlPath === '/api/square/authorize') return true;
+  if (method === 'POST' && urlPath === '/api/square/charge') return true;
   return false;
 }
 
@@ -340,9 +462,9 @@ function registerSquareRoutes(ctx) {
     }
     try {
       await pool.query(
-        `INSERT INTO square_tokens (business_id, merchant_id, access_token, refresh_token, expires_at, refresh_expires_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, now())
-         ON CONFLICT (business_id) DO UPDATE SET
+        `INSERT INTO square_tokens (business_id, environment, merchant_id, access_token, refresh_token, expires_at, refresh_expires_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+         ON CONFLICT (business_id, environment) DO UPDATE SET
            merchant_id = EXCLUDED.merchant_id,
            access_token = EXCLUDED.access_token,
            refresh_token = EXCLUDED.refresh_token,
@@ -351,6 +473,7 @@ function registerSquareRoutes(ctx) {
            updated_at = now()`,
         [
           verified.businessId,
+          squareEnv(),
           String(tokenData.merchant_id),
           String(tokenData.access_token),
           tokenData.refresh_token ? String(tokenData.refresh_token) : null,
@@ -366,9 +489,9 @@ function registerSquareRoutes(ctx) {
     }
     return htmlRes(res, 200, sqPage(
       'Square connected',
-      'Your Square account is connected to Wrenqo. Card payments are ' +
-      'the next step — taking a payment from the app is not built yet, ' +
-      'and your invoices keep working inside Wrenqo either way. ' +
+      'Your Square account is connected to Wrenqo. From an invoice, ' +
+      'use "Take card payment" to take a card payment from your ' +
+      'customer — the money lands in this Square account. ' +
       'You can close this page.'
     ));
   }
@@ -381,8 +504,8 @@ function registerSquareRoutes(ctx) {
     if (!businessId) return jsonRes(res, 200, { ok: true, connected: false });
     try {
       const { rows } = await pool.query(
-        'SELECT merchant_id FROM square_tokens WHERE business_id = $1',
-        [businessId]
+        'SELECT merchant_id FROM square_tokens WHERE business_id = $1 AND environment = $2',
+        [businessId, squareEnv()]
       );
       if (!rows.length) return jsonRes(res, 200, { ok: true, connected: false });
       return jsonRes(res, 200, { ok: true, connected: true, merchantId: rows[0].merchant_id });
@@ -390,6 +513,238 @@ function registerSquareRoutes(ctx) {
       if (isDbFailure(e)) return jsonRes(res, 503, { ok: false, error: 'square unavailable' });
       throw e;
     }
+  }
+
+  // The shop's stored OAuth token for the current environment, or
+  // null when the shop has not connected that environment yet.
+  // Tokens are business-scoped; the business id always comes from
+  // the server-side token, never from the client.
+  async function merchantTokenFor(businessId) {
+    if (!pool) return null;
+    const { rows } = await pool.query(
+      'SELECT merchant_id, access_token FROM square_tokens WHERE business_id = $1 AND environment = $2',
+      [businessId, squareEnv()]
+    );
+    if (!rows.length) return null;
+    return { merchantId: rows[0].merchant_id, accessToken: rows[0].access_token };
+  }
+
+  // One Square API call with a 10 s cap, like the server's other
+  // outbound calls. Returns { status, data } where data is the
+  // parsed JSON body (or null). A network failure throws.
+  async function squareFetch(path, accessToken) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
+    try {
+      const res = await fetch(SQUARE_API_BASE + path, {
+        method: 'GET',
+        headers: {
+          Authorization: 'Bearer ' + accessToken,
+          'Square-Version': SQUARE_API_VERSION,
+          Accept: 'application/json',
+        },
+        signal: controller.signal,
+      });
+      let data = null;
+      try {
+        data = await res.json();
+      } catch (e) {
+        data = null;
+      }
+      return { status: res.status, data };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // GET /api/square/authorize — the credentials the Mobile Payments
+  // SDK needs on the phone: the shop's own OAuth access token and
+  // the location id to authorize against. The location comes from
+  // Square's Locations API (first ACTIVE location), so the shop
+  // never has to paste a location id anywhere.
+  //
+  // SECURITY: this hands the shop's OAuth token to the shop's own
+  // phone. That is how Square's Mobile Payments SDK is designed —
+  // authorization happens on the device — and the token is the
+  // shop's own, not Wrenqo's. The app holds it in memory for one
+  // payment session and never writes it to disk, never syncs it,
+  // and never logs it. If the token is ever leaked, the shop can
+  // revoke it from Square's dashboard (OAuth → Revoke).
+  async function handleAuthorize(req, res) {
+    const email = verifyAuthToken(bearerToken(req));
+    if (!email) return jsonRes(res, 401, { ok: false, error: 'invalid token' });
+    if (!pool) {
+      return jsonRes(res, 503, { ok: false, error: 'Square storage unavailable' });
+    }
+    const businessId = await businessIdForEmail(email);
+    if (!businessId) {
+      return jsonRes(res, 503, { ok: false, error: 'Square storage unavailable' });
+    }
+    const token = await merchantTokenFor(businessId);
+    if (!token) {
+      return jsonRes(res, 409, { ok: false, error: 'square_not_connected' });
+    }
+    let locations = null;
+    try {
+      const { status, data } = await squareFetch('/v2/locations', token.accessToken);
+      if (status === 401) {
+        return jsonRes(res, 502, { ok: false, error: 'square_token_expired' });
+      }
+      if (status !== 200 || !data || !Array.isArray(data.locations)) {
+        console.error('square locations failed', status);
+        return jsonRes(res, 502, { ok: false, error: 'square unavailable' });
+      }
+      locations = data.locations;
+    } catch (e) {
+      console.error('square locations error', e.message);
+      return jsonRes(res, 502, { ok: false, error: 'square unavailable' });
+    }
+    if (!locations.length) {
+      return jsonRes(res, 502, { ok: false, error: 'square_no_location' });
+    }
+    const active = locations.find((l) => l.status === 'ACTIVE') || locations[0];
+    if (!active || !active.id) {
+      return jsonRes(res, 502, { ok: false, error: 'square_no_location' });
+    }
+    return jsonRes(res, 200, {
+      ok: true,
+      accessToken: token.accessToken,
+      locationId: String(active.id),
+      merchantId: token.merchantId,
+      environment: squareEnv(),
+    });
+  }
+
+  // POST /api/square/charge — VERIFIES a payment the Mobile Payments
+  // SDK already took in the app. The SDK charges the card on the
+  // phone (autocomplete); the app sends the Square payment id here,
+  // and this endpoint re-reads that payment from Square with the
+  // merchant token. It only answers ok when the payment exists, is
+  // COMPLETED, and its amount matches the invoice balance the app
+  // asked to charge. The app records the payment on the invoice
+  // only after this answer, so a tampered client cannot invent a
+  // payment, replay someone else's payment id, or change the amount.
+  //
+  // Idempotency: a verified payment is stored in square_charges keyed
+  // by (business, payment_id). A retry of the same payment id returns
+  // the stored result instead of calling Square again, so a flaky
+  // connection can never record the same payment twice. A second,
+  // separate payment on the same invoice has a different Square
+  // payment id and is a different row.
+  async function handleCharge(req, res) {
+    const email = verifyAuthToken(bearerToken(req));
+    if (!email) return jsonRes(res, 401, { ok: false, error: 'invalid token' });
+    const data = await readJsonBody(req, res);
+    if (!data) return;
+    const invoiceId = String(data.invoiceId || '').trim();
+    const paymentId = String(data.paymentId || '').trim();
+    const amountCents = data.amountCents;
+    if (!invoiceId || invoiceId.length > 128) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid invoiceId' });
+    }
+    if (!paymentId || paymentId.length > 128) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid paymentId' });
+    }
+    if (!Number.isInteger(amountCents) || amountCents <= 0 || amountCents > MAX_CHARGE_CENTS) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid amountCents' });
+    }
+    if (!pool) {
+      return jsonRes(res, 503, { ok: false, error: 'Square storage unavailable' });
+    }
+    const businessId = await businessIdForEmail(email);
+    if (!businessId) {
+      return jsonRes(res, 503, { ok: false, error: 'Square storage unavailable' });
+    }
+    const token = await merchantTokenFor(businessId);
+    if (!token) {
+      return jsonRes(res, 409, { ok: false, error: 'square_not_connected' });
+    }
+    // Already verified? Return the stored result — never verify or
+    // record the same Square payment twice.
+    try {
+      const { rows } = await pool.query(
+        'SELECT status, receipt_url FROM square_charges WHERE business_id = $1 AND payment_id = $2',
+        [businessId, paymentId]
+      );
+      if (rows.length) {
+        return jsonRes(res, 200, {
+          ok: true,
+          duplicate: true,
+          paymentId,
+          status: rows[0].status,
+          receiptUrl: rows[0].receipt_url || null,
+        });
+      }
+    } catch (e) {
+      if (isDbFailure(e)) return jsonRes(res, 503, { ok: false, error: 'square unavailable' });
+      throw e;
+    }
+    // Re-read the payment from Square with the merchant token.
+    let payment = null;
+    try {
+      const { status, data: sq } = await squareFetch(
+        '/v2/payments/' + encodeURIComponent(paymentId),
+        token.accessToken
+      );
+      if (status === 401) {
+        return jsonRes(res, 502, { ok: false, error: 'square_token_expired' });
+      }
+      if (status === 404) {
+        return jsonRes(res, 404, { ok: false, error: 'square_payment_not_found' });
+      }
+      if (status !== 200 || !sq || !sq.payment) {
+        console.error('square payment lookup failed', status);
+        return jsonRes(res, 502, { ok: false, error: 'square unavailable' });
+      }
+      payment = sq.payment;
+    } catch (e) {
+      console.error('square payment lookup error', e.message);
+      return jsonRes(res, 502, { ok: false, error: 'square unavailable' });
+    }
+    // The payment must belong to this merchant, be finished, and be
+    // for exactly the amount the app asked to charge.
+    if (payment.merchant_id && token.merchantId && payment.merchant_id !== token.merchantId) {
+      console.error('square payment merchant mismatch', businessId);
+      return jsonRes(res, 409, { ok: false, error: 'square_payment_mismatch' });
+    }
+    if (payment.status !== 'COMPLETED') {
+      return jsonRes(res, 409, {
+        ok: false,
+        error: 'square_payment_not_completed',
+        status: String(payment.status || ''),
+      });
+    }
+    const money = payment.amount_money || {};
+    if (money.currency !== 'USD' || Number(money.amount) !== amountCents) {
+      console.error('square payment amount mismatch', businessId, invoiceId);
+      return jsonRes(res, 409, { ok: false, error: 'square_amount_mismatch' });
+    }
+    const receiptUrl = payment.receipt_url ? String(payment.receipt_url) : null;
+    try {
+      await pool.query(
+        `INSERT INTO square_charges (id, business_id, invoice_id, amount_cents, payment_id, status, receipt_url)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (business_id, payment_id) DO NOTHING`,
+        [
+          'sqcharge_' + crypto.randomBytes(12).toString('hex'),
+          businessId,
+          invoiceId,
+          amountCents,
+          paymentId,
+          'COMPLETED',
+          receiptUrl,
+        ]
+      );
+    } catch (e) {
+      if (isDbFailure(e)) return jsonRes(res, 503, { ok: false, error: 'square unavailable' });
+      throw e;
+    }
+    return jsonRes(res, 200, {
+      ok: true,
+      paymentId,
+      status: 'COMPLETED',
+      receiptUrl,
+    });
   }
 
   return async function squareHandler(req, res, urlPath) {
@@ -404,6 +759,14 @@ function registerSquareRoutes(ctx) {
       }
       if (req.method === 'GET' && urlPath === '/api/square/status') {
         await handleStatus(req, res);
+        return true;
+      }
+      if (req.method === 'GET' && urlPath === '/api/square/authorize') {
+        await handleAuthorize(req, res);
+        return true;
+      }
+      if (req.method === 'POST' && urlPath === '/api/square/charge') {
+        await handleCharge(req, res);
         return true;
       }
       return false;

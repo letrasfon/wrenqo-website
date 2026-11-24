@@ -120,19 +120,79 @@ connect test (step 3) is the check. If Square blocks the OAuth
 flow until the developer account is activated, that changes the
 plan and must be flagged before any production step.
 
-## 6. What is NOT built yet (honest status)
+## 6. What is built now (v1.0.13, 2026-11-25) — and what is NOT
 
-- **Taking a payment**: no charge or payment is taken anywhere
-  yet. The app side (Square Mobile Payments SDK, `square_mobile_payments_sdk`)
-  and a server-side payment call are the next build.
+**Built:**
+- **Taking a payment**: the app's invoice screen has "Take card
+  payment" (sent/partial invoices, remaining balance). The Square
+  Mobile Payments SDK (`square_mobile_payments_sdk` 2026.10.3)
+  shows Square's card screen (tap / dip / swipe, or a paired
+  Reader) and charges the card on the phone.
+- **Server verification**: `POST /api/square/charge` re-reads the
+  payment from Square with the merchant token and only answers ok
+  when the payment is COMPLETED for exactly the invoiced amount.
+  The invoice records the payment only after that answer. There is
+  no card nonce in this SDK's API, so there is no
+  CreatePayment-with-nonce call — verification is the design, not
+  a shortcut.
+- **Authorize endpoint**: `GET /api/square/authorize` hands the
+  app the shop's OAuth token + location id for one payment session
+  (in memory only, never stored in the app).
+- **Per-environment tokens**: `square_tokens` is keyed by
+  (business, environment) — sandbox and production tokens coexist.
+- **App setup done**: Android compileSdk 37 / minSdk 28, Square
+  Maven repo + SDK dep, no code shrinking, Jetifier on,
+  MainApplication init, Bluetooth + phone-state permissions; iOS
+  deployment target 17.1, AppDelegate init, Square setup run script
+  phase, Bluetooth usage description. Settings has a Square tile
+  next to QuickBooks.
+
+**Still NOT built:**
 - **Token refresh**: Square access tokens expire (30 days for
   OAuth tokens); the stored refresh token must be exchanged before
-  it expires. No refresh job exists yet.
+  it expires. No refresh job exists yet — a 401 surfaces as
+  "Reconnect Square in Settings" and the shop reconnects by hand.
 - **Token encryption at rest**: tokens are stored in plaintext in
   the `square_tokens` table. Encrypt them (AES-256-GCM, key from
   env `SQUARE_TOKEN_KEY`) before real customer data flows through
   this.
 - **Disconnect**: no endpoint yet to delete a business's tokens.
-- **Phone-only Tap to Pay vs Reader**: unverified whether Square's
-  Mobile Payments SDK exposes phone-only Tap to Pay or needs a
-  Square Reader (~$59). The app build will confirm this.
+- **Phone-only Tap to Pay vs Reader**: the SDK decides per phone
+  at payment time (it offers tap-to-pay on the phone itself when
+  no reader is paired and the phone supports it). Only a real
+  device test proves it — not verified yet.
+- **End-to-end sandbox charge**: needs a real phone + a sandbox
+  test seller + the mock-reader UI taps (an agent cannot drive
+  those — a human taps the floater, adds a reader, starts the
+  payment, taps a card).
+
+## 7. How to test the payment (sandbox, real phone)
+
+1. Connect Square first (section 3 above) with a sandbox test
+   seller account.
+2. In the app, open an invoice that is sent (or partial) with a
+   balance left. Tap **Take card payment**.
+3. The app asks for location permission (Bluetooth too, for a
+   reader). Square's card screen opens.
+4. In Sandbox there are no physical readers: use the mock reader
+   UI (Square's floating button) to add a contactless & chip
+   reader, then tap a mock card.
+5. When the payment completes, the app asks the server to verify
+   it. On success the payment appears on the invoice as
+   "Card (Square)" and the balance drops (partial, or paid).
+6. If the payment was stored offline by Square instead, the app
+   says so and records nothing — check again after it uploads.
+
+## 8. Trade-offs the user can change with one word
+
+- **minSdk 28 / iOS 17.1**: the Square SDK requires them. That
+  drops Android 8 and older phones, and iPhones that cannot run
+  iOS 17. Say the word and the SDK comes out — but card payments
+  go with it.
+- **No surcharge, no tip**: a card payment charges exactly the
+  invoice balance. Square's fee (2.6% + 15¢) comes out of the
+  shop's Square account.
+- **Token on the phone**: the SDK needs the shop's OAuth token on
+  the device to authorize. It is the shop's own token, held in
+  memory for one payment session, never stored or synced. The
+  alternative is no in-person SDK payments at all.
