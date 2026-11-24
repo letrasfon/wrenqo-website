@@ -250,11 +250,22 @@ async function handleSyncPush(req, res, pool, verifyToken) {
     records.push(v);
   }
   const biz = await resolveBusiness(pool, email);
+  // Server-side role rule (the app UI also blocks this, but the server
+  // is the authority): a technician can create and update records, but
+  // can never delete the business's records. Delete tombstones from a
+  // technician are skipped, not rejected, so the rest of the batch
+  // still syncs and the app's queue drains normally.
+  const isTechnician = biz.role === 'technician';
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     let accepted = 0;
+    let skippedDeletes = 0;
     for (const rec of records) {
+      if (isTechnician && rec.deleted) {
+        skippedDeletes += 1;
+        continue;
+      }
       const out = await client.query(UPSERT_SQL, [
         biz.businessId,
         rec.entity,
@@ -268,7 +279,12 @@ async function handleSyncPush(req, res, pool, verifyToken) {
       accepted += out.rowCount;
     }
     await client.query('COMMIT');
-    return jsonRes(res, 200, { ok: true, accepted, serverTime: new Date().toISOString() });
+    return jsonRes(res, 200, {
+      ok: true,
+      accepted,
+      skippedDeletes,
+      serverTime: new Date().toISOString(),
+    });
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
     throw e;
