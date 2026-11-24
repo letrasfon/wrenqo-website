@@ -36,7 +36,7 @@ const MIME = {
 
 // Valid page paths (49). Any other GET path returns a real 404 instead of
 // the homepage (soft-404 fix, 2026-11-10).
-const PAGE_PATHS = new Set(['/', '/about-us', '/appliance-repair-software', '/blog', '/blog/flat-rate-pricing-guide', '/blog/same-day-invoicing', '/blog/how-to-choose-field-service-software', '/blog/per-technician-pricing-cost', '/blog/recurring-service-routes', '/blog/working-offline-no-signal', '/cleaning-business-software', '/contact-us', '/delete-account', '/electrical-contractor-software', '/faqs', '/field-service-software-by-trade', '/field-service-software-features', '/field-service-software-pricing', '/field-service-software-setup', '/flat-rate-price-book-software', '/garage-door-software', '/handyman-business-software', '/help', '/help/build-price-book', '/help/cancel-subscription', '/help/delete-your-account', '/help/export-data-and-cancel', '/help/five-minute-setup', '/help/import-customers', '/help/online-booking', '/help/send-first-invoice', '/help/sign-in-with-email-code', '/help/start-free-trial', '/hvac-scheduling-app', '/invoicing-software-for-contractors', '/lawn-care-software', '/locksmith-software', '/offline-field-service-app', '/online-booking-software', '/pest-control-software', '/plumbing-scheduling-software', '/pool-service-software', '/privacy-policy', '/quickbooks-field-service-software', '/recurring-jobs-software', '/refund-policy', '/roofing-contractor-software', '/scheduling-dispatch-software', '/terms-of-service', '/work-order-app']);
+const PAGE_PATHS = new Set(['/', '/about-us', '/appliance-repair-software', '/blog', '/blog/flat-rate-pricing-guide', '/blog/same-day-invoicing', '/blog/how-to-choose-field-service-software', '/blog/per-technician-pricing-cost', '/blog/recurring-service-routes', '/blog/working-offline-no-signal', '/cleaning-business-software', '/contact-us', '/customer-portal', '/delete-account', '/electrical-contractor-software', '/faqs', '/field-service-software-by-trade', '/field-service-software-features', '/field-service-software-pricing', '/field-service-software-setup', '/flat-rate-price-book-software', '/garage-door-software', '/handyman-business-software', '/help', '/help/backup-and-restore', '/help/build-price-book', '/help/cancel-subscription', '/help/customer-portal', '/help/delete-your-account', '/help/export-data-and-cancel', '/help/five-minute-setup', '/help/import-customers', '/help/job-costs-and-profit', '/help/online-booking', '/help/recurring-jobs', '/help/send-first-invoice', '/help/sign-in-with-email-code', '/help/signatures-and-payments', '/help/start-free-trial', '/help/track-warranties', '/help/web-dashboard', '/hvac-scheduling-app', '/invoicing-software-for-contractors', '/lawn-care-software', '/locksmith-software', '/offline-field-service-app', '/online-booking-software', '/pest-control-software', '/plumbing-scheduling-software', '/pool-service-software', '/privacy-policy', '/quickbooks-field-service-software', '/recurring-jobs-software', '/refund-policy', '/roadmap', '/roofing-contractor-software', '/scheduling-dispatch-software', '/security', '/changelog', '/terms-of-service', '/web-dashboard', '/work-order-app']);
 
 let transporter = null;
 function getTransporter() {
@@ -576,6 +576,25 @@ function handlePolarWebhook(req, res) {
 // ---------------------------------------------------------------------------
 
 const otpStore = new Map();
+// Per-IP code-request limiter: the per-email 60-second cooldown stops
+// bombing one inbox, this stops one source from bombing many inboxes
+// (30 requests per IP per hour — far above any real shop's use).
+const otpIpHits = new Map();
+function otpIpAllowed(req) {
+  const forwarded = String(req.headers['x-forwarded-for'] || '')
+    .split(',')[0]
+    .trim();
+  const ip = forwarded || String(req.socket.remoteAddress || 'unknown');
+  const now = Date.now();
+  const hits = (otpIpHits.get(ip) || []).filter((t) => now - t < 3600000);
+  if (hits.length >= 30) {
+    otpIpHits.set(ip, hits);
+    return false;
+  }
+  hits.push(now);
+  otpIpHits.set(ip, hits);
+  return true;
+}
 const otpLastSentAt = new Map();
 const polarPlanCache = new Map();
 
@@ -733,6 +752,9 @@ function handleAuthRequestOtp(req, res) {
     const lastSent = otpLastSentAt.get(email) || 0;
     if (Date.now() - lastSent < 60000) {
       return jsonRes(res, 429, { ok: false, error: 'wait a minute before asking for a new code' });
+    }
+    if (!otpIpAllowed(req)) {
+      return jsonRes(res, 429, { ok: false, error: 'too many code requests — try again later' });
     }
     const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
     const hash = crypto.createHash('sha256').update(code + ':' + email).digest('hex');
@@ -1011,6 +1033,36 @@ if (bookingModule && process.env.DATABASE_URL) {
   }
 }
 
+// ------------------------------------------------- portal + dashboard
+// Customer portal (/portal/<code>) + owner web dashboard (/dashboard),
+// module ./portal.js — read-only views over the cloud-sync records.
+// Fail-safe like booking: no DATABASE_URL -> API 503 / friendly page.
+let portalModule = null;
+try {
+  portalModule = require('./portal.js');
+} catch (e) {
+  console.error('portal module failed to load:', e.message);
+}
+let portalHandler = null;
+if (portalModule && process.env.DATABASE_URL) {
+  try {
+    const { Pool } = require('pg');
+    const rawPortalPool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      connectionTimeoutMillis: 10000,
+    });
+    rawPortalPool.on('error', (e) => console.error('portal pool idle error', e.message));
+    portalHandler = portalModule.registerPortalRoutes({
+      pool: rawPortalPool,
+      verifyAuthToken,
+    });
+    console.log('Wrenqo portal + dashboard enabled');
+  } catch (e) {
+    console.error('portal disabled (init failed):', e.message);
+    portalHandler = null;
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   const urlPath = decodeURIComponent(req.url.split('?')[0]);
   // Cloud sync dispatch comes FIRST: the PAGE_PATHS check below 404s
@@ -1035,6 +1087,18 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       console.error('booking dispatch error', e);
       if (!res.headersSent) return jsonRes(res, 503, { ok: false, error: 'booking unavailable' });
+      return;
+    }
+  }
+  // Portal + dashboard dispatch: dynamic paths, before the static
+  // PAGE_PATHS check (which would 404 /portal/<code> and /dashboard).
+  if (portalModule && portalModule.isPortalRoute(req.method, urlPath)) {
+    if (!portalHandler) { portalModule.handlePortalUnavailable(req, res, urlPath); return; }
+    try {
+      if (await portalHandler(req, res, urlPath)) return;
+    } catch (e) {
+      console.error('portal dispatch error', e);
+      if (!res.headersSent) return jsonRes(res, 503, { ok: false, error: 'portal unavailable' });
       return;
     }
   }
