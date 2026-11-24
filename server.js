@@ -1063,6 +1063,71 @@ if (portalModule && process.env.DATABASE_URL) {
   }
 }
 
+// ------------------------------------------------------- media + quickbooks
+// Media upload/download (module ./media.js) and QuickBooks OAuth
+// scaffolding (module ./quickbooks.js). Same fail-safe shape as
+// booking/portal: the modules load even without a database (media
+// falls back to a JSONL metadata file, QuickBooks answers
+// {connected:false} / 503 'not configured'), a load failure only
+// disables that module, and dispatch happens before the PAGE_PATHS
+// 404 fallback below. Media works without a database; QuickBooks
+// connect/callback need DATABASE_URL (token storage) plus the QB_*
+// env vars (see QB_SETUP.md).
+let mediaModule = null;
+try {
+  mediaModule = require('./media.js');
+} catch (e) {
+  console.error('media module failed to load:', e.message);
+}
+let mediaHandler = null;
+if (mediaModule) {
+  try {
+    let rawMediaPool = null;
+    if (process.env.DATABASE_URL) {
+      const { Pool } = require('pg');
+      rawMediaPool = new Pool({
+        connectionString: process.env.DATABASE_URL,
+        connectionTimeoutMillis: 10000,
+      });
+      rawMediaPool.on('error', (e) => console.error('media pool idle error', e.message));
+    }
+    mediaHandler = mediaModule.registerMediaRoutes({ pool: rawMediaPool, verifyAuthToken });
+    console.log('Wrenqo media enabled');
+  } catch (e) {
+    console.error('media disabled (init failed):', e.message);
+    mediaHandler = null;
+  }
+}
+let quickbooksModule = null;
+try {
+  quickbooksModule = require('./quickbooks.js');
+} catch (e) {
+  console.error('quickbooks module failed to load:', e.message);
+}
+let quickbooksHandler = null;
+if (quickbooksModule) {
+  try {
+    let rawQbPool = null;
+    if (process.env.DATABASE_URL) {
+      const { Pool } = require('pg');
+      rawQbPool = new Pool({
+        connectionString: process.env.DATABASE_URL,
+        connectionTimeoutMillis: 10000,
+      });
+      rawQbPool.on('error', (e) => console.error('quickbooks pool idle error', e.message));
+    }
+    quickbooksHandler = quickbooksModule.registerQuickBooksRoutes({
+      pool: rawQbPool,
+      verifyAuthToken,
+      authKey: authKey(),
+    });
+    console.log('Wrenqo QuickBooks scaffolding enabled');
+  } catch (e) {
+    console.error('quickbooks disabled (init failed):', e.message);
+    quickbooksHandler = null;
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   const urlPath = decodeURIComponent(req.url.split('?')[0]);
   // Cloud sync dispatch comes FIRST: the PAGE_PATHS check below 404s
@@ -1099,6 +1164,31 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       console.error('portal dispatch error', e);
       if (!res.headersSent) return jsonRes(res, 503, { ok: false, error: 'portal unavailable' });
+      return;
+    }
+  }
+  // Media upload/download dispatch: dynamic paths, before the static
+  // PAGE_PATHS check (which would 404 /api/media/<id>).
+  if (mediaModule && mediaModule.isMediaRoute(req.method, urlPath)) {
+    if (!mediaHandler) { mediaModule.handleMediaUnavailable(req, res, urlPath); return; }
+    try {
+      if (await mediaHandler(req, res, urlPath)) return;
+    } catch (e) {
+      console.error('media dispatch error', e);
+      if (!res.headersSent) return jsonRes(res, 503, { ok: false, error: 'media unavailable' });
+      return;
+    }
+  }
+  // QuickBooks OAuth scaffolding dispatch: /api/quickbooks/*, before
+  // the static PAGE_PATHS check (which would 404 the callback URL
+  // Intuit redirects to).
+  if (quickbooksModule && quickbooksModule.isQuickBooksRoute(req.method, urlPath)) {
+    if (!quickbooksHandler) { quickbooksModule.handleQuickBooksUnavailable(req, res, urlPath); return; }
+    try {
+      if (await quickbooksHandler(req, res, urlPath)) return;
+    } catch (e) {
+      console.error('quickbooks dispatch error', e);
+      if (!res.headersSent) return jsonRes(res, 503, { ok: false, error: 'quickbooks unavailable' });
       return;
     }
   }

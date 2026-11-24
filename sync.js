@@ -48,9 +48,17 @@
 const crypto = require('crypto');
 
 // Same entity set as the app's local SQLite tables (database.dart) and
-// the Stage 2 prepared sync code.
+// the Stage 2 prepared sync code. 'messages' is the in-app messaging
+// entity: a message record is generic JSON { id, conversationKey,
+// senderName, text, at } where conversationKey is 'job:<jobId>' |
+// 'customer:<customerId>' | 'team:<businessId>'. Messages sync through
+// the same Postgres table, Bearer auth and business scoping as every
+// other entity — no new table, no new endpoint. Push notifications
+// (FCM) are a separate job: they need a Firebase project and are NOT
+// part of this sync entity; the app polls/pulls for new messages.
 const SYNC_ENTITIES = new Set([
   'customers', 'jobs', 'quotes', 'invoices', 'price_book', 'equipment', 'reminders',
+  'messages',
 ]);
 const MAX_PUSH_RECORDS = 500; // mirrors the Stage 2 MAX_SYNC_CHANGES
 const MAX_PULL_RECORDS = 5000;
