@@ -1063,16 +1063,18 @@ if (portalModule && process.env.DATABASE_URL) {
   }
 }
 
-// ------------------------------------------------------- media + quickbooks
-// Media upload/download (module ./media.js) and QuickBooks OAuth
-// scaffolding (module ./quickbooks.js). Same fail-safe shape as
+// ------------------------------------------------------- media + quickbooks + square
+// Media upload/download (module ./media.js), QuickBooks OAuth
+// scaffolding (module ./quickbooks.js) and Square OAuth scaffolding
+// (module ./square.js). Same fail-safe shape as
 // booking/portal: the modules load even without a database (media
-// falls back to a JSONL metadata file, QuickBooks answers
+// falls back to a JSONL metadata file, QuickBooks and Square answer
 // {connected:false} / 503 'not configured'), a load failure only
 // disables that module, and dispatch happens before the PAGE_PATHS
 // 404 fallback below. Media works without a database; QuickBooks
 // connect/callback need DATABASE_URL (token storage) plus the QB_*
-// env vars (see QB_SETUP.md).
+// env vars (see QB_SETUP.md), and Square connect/callback need
+// DATABASE_URL plus the SQUARE_* env vars (see SQUARE_SETUP.md).
 let mediaModule = null;
 try {
   mediaModule = require('./media.js');
@@ -1125,6 +1127,35 @@ if (quickbooksModule) {
   } catch (e) {
     console.error('quickbooks disabled (init failed):', e.message);
     quickbooksHandler = null;
+  }
+}
+let squareModule = null;
+try {
+  squareModule = require('./square.js');
+} catch (e) {
+  console.error('square module failed to load:', e.message);
+}
+let squareHandler = null;
+if (squareModule) {
+  try {
+    let rawSqPool = null;
+    if (process.env.DATABASE_URL) {
+      const { Pool } = require('pg');
+      rawSqPool = new Pool({
+        connectionString: process.env.DATABASE_URL,
+        connectionTimeoutMillis: 10000,
+      });
+      rawSqPool.on('error', (e) => console.error('square pool idle error', e.message));
+    }
+    squareHandler = squareModule.registerSquareRoutes({
+      pool: rawSqPool,
+      verifyAuthToken,
+      authKey: authKey(),
+    });
+    console.log('Wrenqo Square scaffolding enabled');
+  } catch (e) {
+    console.error('square disabled (init failed):', e.message);
+    squareHandler = null;
   }
 }
 
@@ -1189,6 +1220,19 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       console.error('quickbooks dispatch error', e);
       if (!res.headersSent) return jsonRes(res, 503, { ok: false, error: 'quickbooks unavailable' });
+      return;
+    }
+  }
+  // Square OAuth scaffolding dispatch: /api/square/*, before the
+  // static PAGE_PATHS check (which would 404 the callback URL Square
+  // redirects to).
+  if (squareModule && squareModule.isSquareRoute(req.method, urlPath)) {
+    if (!squareHandler) { squareModule.handleSquareUnavailable(req, res, urlPath); return; }
+    try {
+      if (await squareHandler(req, res, urlPath)) return;
+    } catch (e) {
+      console.error('square dispatch error', e);
+      if (!res.headersSent) return jsonRes(res, 503, { ok: false, error: 'square unavailable' });
       return;
     }
   }
