@@ -32,7 +32,12 @@ const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.xml': 'application/xml; charset=utf-8',
   '.txt': 'text/plain; charset=utf-8',
+  '.ico': 'image/x-icon',
+  '.png': 'image/png',
 };
+
+// Static files served from disk (favicon set, 2026-11-25).
+const STATIC_FILES = new Set(['/favicon.ico', '/favicon-16x16.png', '/favicon-32x32.png', '/apple-touch-icon.png']);
 
 // Valid page paths (49). Any other GET path returns a real 404 instead of
 // the homepage (soft-404 fix, 2026-11-10).
@@ -1249,12 +1254,12 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(301, { Location: '/blog/same-day-invoicing' });
     return res.end();
   }
-  if (req.method === 'GET' && urlPath !== '/sitemap.xml' && urlPath !== '/robots.txt' && !PAGE_PATHS.has(urlPath)) {
+  if (req.method === 'GET' && urlPath !== '/sitemap.xml' && urlPath !== '/robots.txt' && !STATIC_FILES.has(urlPath) && !PAGE_PATHS.has(urlPath)) {
     res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
     return res.end('<!doctype html><html><head><title>Page not found — Wrenqo</title><meta name="robots" content="noindex, follow"></head><body><h1>Page not found</h1><p>Sorry, this page does not exist. <a href="/">Go to the Wrenqo home page</a>.</p></body></html>');
   }
   let file = path.join(__dirname, 'index.html');
-  if (urlPath === '/sitemap.xml' || urlPath === '/robots.txt') {
+  if (urlPath === '/sitemap.xml' || urlPath === '/robots.txt' || STATIC_FILES.has(urlPath)) {
     file = path.join(__dirname, urlPath);
   }
   fs.readFile(file, (err, data) => {
